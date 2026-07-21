@@ -1,0 +1,109 @@
+# ============================================================
+# PFE2026 - Microservices version, reusing existing Redis + Qdrant
+# ============================================================
+services:
+
+  gateway:
+    build: ./gateway
+    container_name: pfe2026_gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - DOCUMENT_SERVICE_URL=http://document-service:8001
+      - QA_SERVICE_URL=http://qa-service:8002
+      - GATEWAY_API_KEY=${GATEWAY_API_KEY:-}
+    depends_on:
+      - document-service
+      - qa-service
+    restart: unless-stopped
+
+  document-service:
+    build: ./services/document-service
+    container_name: pfe2026_document_service
+    ports:
+      - "8001:8001"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_API_KEY_2=${GEMINI_API_KEY_2:-}
+      - GEMINI_API_KEY_3=${GEMINI_API_KEY_3:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_COLLECTION=pfe2026_docs
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - qdrant
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  qa-service:
+    build: ./services/qa-service
+    container_name: pfe2026_qa_service
+    ports:
+      - "8002:8002"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_API_KEY_2=${GEMINI_API_KEY_2:-}
+      - GEMINI_API_KEY_3=${GEMINI_API_KEY_3:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_COLLECTION=pfe2026_docs
+      - REDIS_URL=redis://redis:6379/0
+      - DOCUMENT_SERVICE_URL=http://document-service:8001
+    depends_on:
+      - redis
+      - qdrant
+      - document-service
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  celery-worker:
+    build:
+      context: ./services/qa-service
+      dockerfile: Dockerfile.celery
+    container_name: pfe2026_celery_worker
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_API_KEY_2=${GEMINI_API_KEY_2:-}
+      - GEMINI_API_KEY_3=${GEMINI_API_KEY_3:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_COLLECTION=pfe2026_docs
+      - REDIS_URL=redis://redis:6379/0
+      - DOCUMENT_SERVICE_URL=http://document-service:8001
+    depends_on:
+      - redis
+      - qdrant
+      - document-service
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: pfe2026_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - pfe2026_redis_data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: pfe2026_qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - pfe2026_qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  pfe2026_redis_data:
+    external: true
+  pfe2026_qdrant_storage:
+    external: true
