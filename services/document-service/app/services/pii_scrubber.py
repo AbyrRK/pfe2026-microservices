@@ -25,6 +25,24 @@ Placeholder format:  [EMAIL], [PHONE], [PERSON], [ORG], [LOCATION],
                      [CREDIT_CARD], [IBAN], [PASSPORT], [NATIONAL_ID],
                      [IP_ADDRESS], [CRYPTO], [DATE_OF_BIRTH], [URL_PII]
 
+CHANGE (precision fix — context-gated NATIONAL_ID / PASSPORT patterns):
+    The original patterns matched ANY standalone 8-digit number or ANY
+    1-2 letters followed by 6-9 digits as a national ID / passport. Given this
+    app's core domain is invoices and contracts — documents full of
+    legitimate 8-digit reference numbers, invoice totals, and alphanumeric
+    SKUs/codes — these patterns risked redacting exactly the data a user
+    is asking the RAG pipeline about (e.g. "what's my invoice total?"
+    could have its answer replaced with "[NATIONAL_ID]").
+
+    Both patterns now require an explicit nearby label (CIN, carte
+    d'identité, national ID, بطاقة تعريف / passeport, passport, جواز سفر)
+    before the number, and the WHOLE match (label + number) is replaced
+    by the placeholder. This trades some recall (an unlabeled ID number
+    in the wild won't be caught) for much higher precision on business
+    documents — the right tradeoff here, since false positives on
+    financial data are more damaging to this app's core function than
+    occasionally missing an unlabeled ID.
+
 Usage:
     from app.services.pii_scrubber import scrub_pii
 
@@ -53,14 +71,14 @@ def _get_analyzer():
     Falls back gracefully if a model is missing.
     """
     try:
-        from presidio_analyzer import AnalyzerEngine
-        from presidio_analyzer.nlp_engine import NlpEngineProvider
+        from presidio_analyzer import AnalyzerEngine # type: ignore
+        from presidio_analyzer.nlp_engine import NlpEngineProvider # type: ignore
 
         # Try to load both EN (large) and FR (medium) models
         models = []
         for model_name, lang in [("en_core_web_lg", "en"), ("fr_core_news_md", "fr")]:
             try:
-                import spacy
+                import spacy # pyright: ignore[reportMissingImports]
                 spacy.load(model_name)
                 models.append({"lang_code": lang, "model_name": model_name})
                 logger.info(f"[PII] spaCy model loaded: {model_name}")
@@ -101,7 +119,7 @@ def _get_analyzer():
 @lru_cache(maxsize=1)
 def _get_anonymizer():
     try:
-        from presidio_anonymizer import AnonymizerEngine
+        from presidio_anonymizer import AnonymizerEngine # pyright: ignore[reportMissingImports]
         return AnonymizerEngine()
     except ImportError:
         logger.error("[PII] presidio-anonymizer not installed — pip install presidio-anonymizer")
@@ -175,13 +193,29 @@ _REGEX_PATTERNS = [
     (r'\b[A-Z]{2}\d{2}[\s]?(?:[A-Z0-9]{4}[\s]?){2,7}[A-Z0-9]{1,4}\b', "[IBAN]"),
 
     # Matricule fiscal (Tunisia) — 7 digits + letter + 3 digits + letter
+    # Already specific enough (fixed 7-1-3-1 structure) — low false-positive
+    # risk on invoice/reference numbers, left unchanged.
     (r'\b\d{7}[A-Z]\d{3}[A-Z]\b', "[TAX_ID]"),
 
-    # CIN (Tunisia / Morocco / Algeria) — 8 digits standalone
-    (r'\b\d{8}\b', "[NATIONAL_ID]"),
+    # ── National ID (CIN / carte d'identité / بطاقة تعريف) — CONTEXT-GATED ──
+    # Previously: r'\b\d{8}\b' — matched ANY standalone 8-digit number,
+    # which is extremely common in invoices (totals, references, quantities).
+    # Now requires an explicit label immediately before the digits.
+    (
+        r'\b(?:CIN|C\.I\.N\.?|carte\s+d[\'’]identit[ée]|national\s*id(?:entity)?\s*(?:no\.?|number|n[°o])?|'
+        r'بطاقة\s*تعريف(?:\s*وطنية)?|رقم\s*البطاقة)\s*[:\-#n°]*\s*\d{8}\b',
+        "[NATIONAL_ID]",
+    ),
 
-    # Passport (generic international) — 1-2 letters + 6-9 digits
-    (r'\b[A-Z]{1,2}\d{6,9}\b', "[PASSPORT]"),
+    # ── Passport — CONTEXT-GATED ─────────────────────────────────────────────
+    # Previously: r'\b[A-Z]{1,2}\d{6,9}\b' — matched almost any invoice
+    # number, SKU, or reference code (e.g. "AB123456", "INV1234567").
+    # Now requires "passport"/"passeport"/"جواز سفر" immediately before it.
+    (
+        r'\b(?:passport|passeport|pass\.?\s*n[°o]?|جواز\s*سفر)\s*[:\-#n°]*\s*'
+        r'[A-Z]{1,2}\d{6,9}\b',
+        "[PASSPORT]",
+    ),
 
     # Email (backup — presidio usually catches these)
     (r'\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b', "[EMAIL]"),
@@ -190,7 +224,10 @@ _REGEX_PATTERNS = [
     (r'\b(?:\d{1,3}\.){3}\d{1,3}\b', "[IP_ADDRESS]"),
 ]
 
-_COMPILED_REGEX = [(re.compile(pattern), replacement) for pattern, replacement in _REGEX_PATTERNS]
+_COMPILED_REGEX = [
+    (re.compile(pattern, re.IGNORECASE), replacement)
+    for pattern, replacement in _REGEX_PATTERNS
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -274,7 +311,7 @@ def scrub_pii(
                 )
 
                 if results:
-                    from presidio_anonymizer.entities import OperatorConfig
+                    from presidio_anonymizer.entities import OperatorConfig # pyright: ignore[reportMissingImports]
 
                     # Build custom operators so each entity type gets its own placeholder
                     operators = {}

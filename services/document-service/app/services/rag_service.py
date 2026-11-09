@@ -178,66 +178,85 @@ class RAGService:
         save_session(session_id)
         return answer
 
+    from app.services.pii_scrubber import scrub_prompt
+ 
+ 
     def ask(self, question: str, session_id: str, k: int = 5) -> dict:
         """Non-streaming RAG answer with conversation history."""
         docs    = self._get_context(question, session_id, k)
         context = self._format_docs(docs)
         sources = self._extract_sources(docs)
-
+    
         if not context.strip():
             return {"answer": "Not found in document.", "sources": []}
-
+    
+        # Scrub the question ONCE — reused for both the prompt sent to Gemini
+        # and the history write, so the clean version is what gets replayed in
+        # every future turn of this session too.
+        safe_question = scrub_prompt(question, language="en")
+    
         # Snapshot history BEFORE adding user message to avoid duplicate in prompt
         history = get_session_history(session_id)
         existing_messages = list(history.messages)
-        history.add_user_message(question)
+        history.add_user_message(safe_question)
         save_session(session_id)
-
+    
         chain  = self.rag_prompt | self.llm | self.parser
         answer = chain.invoke({
             "context":  context,
-            "question": question,
+            "question": safe_question,
             "history":  existing_messages,
         })
-
+    
         answer = self._clean_answer(answer)
         history.add_ai_message(answer)
         save_session(session_id)
         return {"answer": answer, "sources": sources}
-
+    
+    
     def ask_stream(self, question: str, session_id: str, k: int = 5):
         """Streaming RAG answer with conversation history."""
         docs    = self._get_context(question, session_id, k)
         context = self._format_docs(docs)
         sources = self._extract_sources(docs)
-
+    
         if not context.strip():
             yield {"sources": []}
             yield {"token": "Not found in document."}
             return
-
-        # Snapshot history BEFORE adding user message to avoid duplicate in prompt
+    
+        safe_question = scrub_prompt(question, language="en")
+    
         history = get_session_history(session_id)
         existing_messages = list(history.messages)
-        history.add_user_message(question)
+        history.add_user_message(safe_question)
         save_session(session_id)
-
+    
         yield {"sources": sources}
-
+    
         chain = self.rag_prompt | self.llm | self.parser
         full_response = []
-
+    
         for token in chain.stream({
             "context":  context,
-            "question": question,
+            "question": safe_question,
             "history":  existing_messages,
         }):
             full_response.append(token)
-            yield {"token": token}
-
+            # If the underlying chunk is large (LLM didn't stream finely),
+            # break it into word-sized pieces so the UI still shows a
+            # visible typing effect instead of one block appearing.
+            if len(token) > 15:
+                words = token.split(" ")
+                for w in words:
+                    yield {"token": w + " "}
+            else:
+                yield {"token": token}
+    
         clean = self._clean_answer("".join(full_response))
         history.add_ai_message(clean)
         save_session(session_id)
+    
 
 
 rag_service = RAGService()

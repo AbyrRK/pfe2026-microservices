@@ -10,10 +10,28 @@ CHANGE (table-aware chunking):
   - DOCX and XLSX tables are now ALWAYS converted to Markdown (not just in
     "table" mode). Markdown preserves row/column relationships that plain
     tab/pipe-joined text destroys.
+  - PDF and Image extraction now ALSO always run table detection (not just
+    in "table" mode) — this closes the gap where a table's totals/TVA row
+    could end up separated from its line items after generic text chunking,
+    because RecursiveCharacterTextSplitter has no concept of table rows.
   - Chunking is split into two passes: body text goes through the normal
     RecursiveCharacterTextSplitter; table Markdown goes through the
     table-aware path in chunking_service.create_chunks() (content_type="table"),
     which avoids splitting a table mid-row. Results are merged before indexing.
+
+CHANGE (deferred-chunk durability):
+  - _deferred_chunks was an in-memory dict — lost on restart, invisible
+    across multiple workers/replicas, and had a check-then-act race on
+    pop(). Replaced with app.services.deferred_chunks, a Redis-backed
+    queue with an atomic pop-all (Lua script) and a TTL for abandoned
+    sessions. See that module's docstring for details.
+
+NOTE: table_service.extract_tables() now runs on every scanned PDF/image
+upload, not just when mode=="table". If that function performs its own OCR
+pass internally for scanned inputs, this means scanned documents may be
+OCR'd twice per upload (once for body text via ocr_service, once for tables
+via table_service). Verify this isn't a meaningful performance regression
+on large scanned PDFs before shipping to production.
 """
 
 import time
@@ -30,7 +48,8 @@ from app.services.text_processor import process_text
 from app.services.chunking_service import create_chunks
 from app.services.vector_store import vector_store
 from app.services.rag_service import rag_service
-
+from app.services.pii_scrubber import scrub_pii
+from app.services.chunking_service import create_chunks
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -247,12 +266,19 @@ def _extract_pdf(path: Path, mode: str) -> dict:
     total        = len(doc)
     is_scanned   = _is_scanned_pdf(doc)
     page_indices = _select_pages(doc, mode, total, is_scanned)
+    doc.close()
+
+    _prefetched_text = None
+    if is_scanned:
+        from app.services.ocr_service import ocr_pdf_pages
+        _prefetched_text = ocr_pdf_pages(str(path), page_indices)
+
+    from app.services.table_service import extract_tables
+    result = extract_tables(
+        str(path), page_indices, is_scanned, existing_text=_prefetched_text
+    )
 
     if mode == "table":
-        doc.close()
-        from app.services.table_service import extract_tables
-        result = extract_tables(str(path), page_indices, is_scanned)
-
         parts = []
         if result["text"].strip():
             parts.append(result["text"])
@@ -266,7 +292,7 @@ def _extract_pdf(path: Path, mode: str) -> dict:
 
         return {
             "text":              "\n\n".join(parts),
-            "body_text":         result["text"],          # ← NEW: text without table dump
+            "body_text":         result["text"],
             "pages_total":       total,
             "pages_read":        len(page_indices),
             "pages_selected":    [i + 1 for i in page_indices],
@@ -277,29 +303,28 @@ def _extract_pdf(path: Path, mode: str) -> dict:
         }
 
     if is_scanned:
-        doc.close()
-        from app.services.ocr_service import ocr_pdf_pages
-        text   = ocr_pdf_pages(str(path), page_indices)
+        text   = _prefetched_text
         method = "ocr"
     else:
+        doc2  = fitz.open(str(path))
         parts = [
-            f"[Page {idx + 1}]\n{doc[idx].get_text('text')}"
+            f"[Page {idx + 1}]\n{doc2[idx].get_text('text')}"
             for idx in page_indices
         ]
         text   = "\n\n".join(parts)
         method = "native"
-        doc.close()
+        doc2.close()
 
     return {
         "text":              text,
-        "body_text":         text,        # ← NEW: no tables extracted in non-table PDF modes
+        "body_text":         text,
         "pages_total":       total,
         "pages_read":        len(page_indices),
         "pages_selected":    [i + 1 for i in page_indices],
         "extraction_method": method,
         "is_scanned":        is_scanned,
-        "tables":            [],
-        "tables_found":      0,
+        "tables":            result["tables"],
+        "tables_found":      result["tables_found"],
     }
 
 
@@ -316,15 +341,11 @@ def _extract_docx(path: Path, mode: str) -> dict:
 
     body_text = "\n\n".join(p.text for p in selected)
 
-    # ── ALWAYS extract tables as proper Markdown (any mode) ───────────────────
-    # Markdown preserves row/column structure, which the previous
-    # " | "-joined flattening destroyed for retrieval/chunking purposes.
     tables: list[dict] = []
     for t_idx, table in enumerate(doc.tables):
         raw_rows = []
         for row in table.rows:
             row_data = [cell.text.strip() for cell in row.cells]
-            # deduplicate merged cells (DOCX repeats merged cell content)
             seen_cells = []
             for cell in row_data:
                 if not seen_cells or cell != seen_cells[-1]:
@@ -350,18 +371,15 @@ def _extract_docx(path: Path, mode: str) -> dict:
     else:
         print(f"[DOCX] No tables found in {path.name}")
 
-    # Human-readable combined text (for display/full_text/word_count) —
-    # includes table Markdown appended, same as before, just better-formatted.
     text = body_text
     if tables:
         text += "\n\n--- EXTRACTED TABLES ---\n"
         for t in tables:
             text += f"\n[Table {t['table_index']}]\n{t['markdown']}\n"
-    # ─────────────────────────────────────────────────────────────────────────
 
     return {
         "text":              text,
-        "body_text":         body_text,   # prose only, used for normal chunking
+        "body_text":         body_text,
         "pages_total":       len(paras),
         "pages_read":        len(selected),
         "pages_selected":    [],
@@ -386,7 +404,6 @@ def _extract_xlsx(path: Path, mode: str) -> dict:
         for i, row in enumerate(ws.iter_rows(values_only=True)):
             if row_limit is not None and i >= row_limit:
                 break
-            # skip fully-empty rows
             if all(c is None or str(c).strip() == "" for c in row):
                 continue
             raw_rows.append(list(row))
@@ -404,7 +421,7 @@ def _extract_xlsx(path: Path, mode: str) -> dict:
             "row_count":   len(raw_rows) - 1,
             "col_count":   len(raw_rows[0]) if raw_rows else 0,
         })
-        body_parts.append(f"[Sheet: {name}]")  # lightweight marker, full data lives in `tables`
+        body_parts.append(f"[Sheet: {name}]")
 
     wb.close()
 
@@ -417,7 +434,7 @@ def _extract_xlsx(path: Path, mode: str) -> dict:
 
     return {
         "text":              text,
-        "body_text":         body_text,   
+        "body_text":         body_text,
         "pages_total":       len(all_sheet_names),
         "pages_read":        len(sheets),
         "pages_selected":    [],
@@ -443,7 +460,7 @@ def _extract_html(path: Path, mode: str) -> dict:
     text = "\n".join(lines)
     return {
         "text":              text,
-        "body_text":         text,        
+        "body_text":         text,
         "pages_total":       1,
         "pages_read":        1,
         "pages_selected":    [1],
@@ -455,10 +472,21 @@ def _extract_html(path: Path, mode: str) -> dict:
 
 
 def _extract_image(path: Path, mode: str) -> dict:
-    if mode == "table":
-        from app.services.table_service import extract_tables
-        result = extract_tables(str(path), page_indices=[0], is_scanned=True)
+    from app.services.ocr_service import ocr_image
+    ocr_result = ocr_image(str(path))
 
+    print(f"[DEBUG] Image OCR: engine={ocr_result['metadata'].get('ocr_engine', 'unknown')}, "
+          f"confidence={ocr_result['metadata'].get('ocr_confidence', 0):.1f}%, "
+          f"text_length={len(ocr_result.get('text', ''))} chars")
+
+    text = ocr_result.get("text", "")
+
+    from app.services.table_service import extract_tables
+    result = extract_tables(
+        str(path), page_indices=[0], is_scanned=True, existing_text=text
+    )
+
+    if mode == "table":
         parts = []
         if result.get("text", "").strip():
             parts.append(result["text"])
@@ -469,7 +497,7 @@ def _extract_image(path: Path, mode: str) -> dict:
 
         return {
             "text":              "\n\n".join(parts),
-            "body_text":         result.get("text", ""),   
+            "body_text":         result.get("text", ""),
             "pages_total":       1,
             "pages_read":        1,
             "pages_selected":    [1],
@@ -481,26 +509,18 @@ def _extract_image(path: Path, mode: str) -> dict:
             "tables_found":      result.get("tables_found", 0),
         }
 
-    from app.services.ocr_service import ocr_image
-    result = ocr_image(str(path))
-
-    print(f"[DEBUG] Image OCR: engine={result['metadata'].get('ocr_engine', 'unknown')}, "
-          f"confidence={result['metadata'].get('ocr_confidence', 0):.1f}%, "
-          f"text_length={len(result.get('text', ''))} chars")
-
-    text = result.get("text", "")
     return {
         "text":              text,
-        "body_text":         text,         
+        "body_text":         text,
         "pages_total":       1,
         "pages_read":        1,
         "pages_selected":    [1],
-        "extraction_method": result.get("metadata", {}).get("ocr_engine", "unknown"),
+        "extraction_method": ocr_result.get("metadata", {}).get("ocr_engine", "unknown"),
         "is_scanned":        True,
-        "is_handwritten":    result.get("metadata", {}).get("is_handwritten", False),
-        "ocr_confidence":    result.get("metadata", {}).get("ocr_confidence", 0),
-        "tables":            [],
-        "tables_found":      0,
+        "is_handwritten":    ocr_result.get("metadata", {}).get("is_handwritten", False),
+        "ocr_confidence":    ocr_result.get("metadata", {}).get("ocr_confidence", 0),
+        "tables":            result.get("tables", []),
+        "tables_found":      result.get("tables_found", 0),
     }
 
 
@@ -508,21 +528,44 @@ def _extract_image(path: Path, mode: str) -> dict:
 # Table-aware chunk builder
 # ─────────────────────────────────────────────────────────────────────────────
 
+"""
+Patch for document_service.py — wires PII scrubbing into the ingestion path,
+before text is chunked and embedded into Qdrant.
+"""
+
+
+
+
 def _build_chunks_for_indexing(body_text: str, tables: list, base_metadata: dict) -> list:
     """
     Chunks body prose and table Markdown SEPARATELY so tables are never
     split mid-row by the generic recursive text splitter.
 
-    - body_text  -> normal chunking (content_type defaults to "text")
-    - each table -> chunked via the table-aware path in chunking_service
-                    (content_type="table"), which prefers row boundaries
-                    and keeps small tables as a single chunk.
+    CHANGE (PII scrubbing wired in): body text and table Markdown are now
+    scrubbed via scrub_pii() BEFORE chunking/embedding — this is the actual
+    integration point pii_scrubber.py's own docstring describes ("before
+    text is chunked and embedded"), which was previously missing entirely.
+    Table markdown is scrubbed with skip_table_ner=True so PERSON/LOCATION/
+    ORG detection is skipped (avoids turning product/company names in a
+    table into [PERSON]) — only regex-based entities (email, phone, IBAN,
+    labeled national IDs/passports) apply there.
+
+    - body_text  -> scrubbed, then normal chunking (content_type defaults to "text")
+    - each table -> scrubbed (table-safe mode), then chunked via the
+                    table-aware path in chunking_service (content_type="table")
     """
     chunks: list[dict] = []
+    language = base_metadata.get("language", "en")
 
     if body_text and body_text.strip():
+        scrubbed_body, report = scrub_pii(body_text, language=language, skip_table_ner=False)
+        if report["scrubbed"]:
+            print(
+                f"🔒 PII scrubbed from body text: {report['entities_found']} entities "
+                f"({', '.join(report['types'])})"
+            )
         chunks.extend(create_chunks(
-            text=body_text,
+            text=scrubbed_body,
             metadata={**base_metadata, "content_type": "text"},
         ))
 
@@ -530,6 +573,11 @@ def _build_chunks_for_indexing(body_text: str, tables: list, base_metadata: dict
         markdown = t.get("markdown", "")
         if not markdown.strip():
             continue
+
+        scrubbed_markdown, report = scrub_pii(markdown, language=language, skip_table_ner=True)
+        if report["scrubbed"]:
+            print(f"🔒 PII scrubbed from table: {report['entities_found']} entities")
+
         table_metadata = {
             **base_metadata,
             "content_type": "table",
@@ -537,7 +585,7 @@ def _build_chunks_for_indexing(body_text: str, tables: list, base_metadata: dict
             "table_index":  t.get("table_index"),
             "sheet_name":   t.get("sheet_name"),
         }
-        chunks.extend(create_chunks(text=markdown, metadata=table_metadata))
+        chunks.extend(create_chunks(text=scrubbed_markdown, metadata=table_metadata))
 
     return chunks
 
@@ -652,7 +700,7 @@ def process_document(
     index:      bool = False,
     session_id: str  = "",
     file_name:  str  = "",
-    doc_id:     str  = "",          #  pass in or leave blank to skip indexing with doc_id
+    doc_id:     str  = "",
 ) -> dict:
     if mode not in ("brief", "summary", "full", "table"):
         raise ValueError(f"Invalid mode '{mode}'. Choose: brief | summary | full | table")
@@ -682,8 +730,6 @@ def process_document(
         text      = processed["clean_text"]
         language  = processed["language"]
 
-        # body_text also needs the same cleaning pass before chunking,
-        # otherwise table chunks are "clean" but prose chunks aren't.
         processed_body = process_text(body_text)
         body_text       = processed_body["clean_text"]
     else:
@@ -704,7 +750,7 @@ def process_document(
     if index:
         base_metadata = {
             "file_name":         display_name,
-            "doc_id":            doc_id,           
+            "doc_id":            doc_id,
             "file_type":         suffix.lstrip("."),
             "language":          language,
             "extraction_method": result["extraction_method"],
@@ -730,7 +776,7 @@ def process_document(
     return {
         "status":    "success",
         "file_name": display_name,
-        "doc_id":    doc_id,          #  returned so caller can store/forward it
+        "doc_id":    doc_id,
         "file_type": suffix.lstrip("."),
         "file_size_kb": round(path.stat().st_size / 1024, 2),
         "mode": mode,
@@ -746,7 +792,7 @@ def process_document(
             "language":          language,
             "content":           display_content,
             "full_text":         text,
-            "body_text":         body_text,       # exposed for callers that need it
+            "body_text":         body_text,
             "tables":            result.get("tables", []),
             "tables_found":      result.get("tables_found", 0),
             "indexed":           chunks_created > 0,
@@ -791,8 +837,12 @@ def ingest_document(extracted_text: str, file_metadata: dict) -> dict:
 # ═════════════════════════════════════════════════════════════════════════════
 
 from app.services.chat_memory import get_session_history, save_session, add_session_file, get_session_files
-
-_deferred_chunks: dict[str, list] = {}
+from app.services.deferred_chunks import (
+    defer_chunks,
+    peek_deferred_chunks,
+    pop_deferred_chunks,
+    has_deferred_chunks,
+)
 
 
 def process_and_respond(
@@ -803,7 +853,7 @@ def process_and_respond(
     index:      bool = True,
     lazy:       bool = True,
     file_name:  str = "",
-    doc_id:     str = "",          
+    doc_id:     str = "",
 ) -> dict:
     """
     Extract document and either answer immediately or return a brief.
@@ -819,13 +869,13 @@ def process_and_respond(
         index=False,
         session_id=session_id,
         file_name=file_name,
-        doc_id=doc_id,             
+        doc_id=doc_id,
     )
 
     extraction   = result.get("extraction", {})
     text         = extraction.get("full_text", "")
-    body_text    = extraction.get("body_text", text)   
-    tables       = extraction.get("tables", [])         
+    body_text    = extraction.get("body_text", text)
+    tables       = extraction.get("tables", [])
     scanned_note = None
     if extraction.get("is_scanned"):
         scanned_note = (
@@ -841,7 +891,7 @@ def process_and_respond(
     #    separately from body text so rows never get split mid-record.
     base_metadata = {
         "file_name":         display_name,
-        "doc_id":            doc_id,        
+        "doc_id":            doc_id,
         "file_type":         result["file_type"],
         "language":          extraction.get("language", "unknown"),
         "extraction_method": extraction.get("extraction_method", "unknown"),
@@ -863,16 +913,13 @@ def process_and_respond(
     except Exception:
         pass
 
-    # 5. Lazy path: defer indexing
+    # 5. Lazy path: defer indexing (now durable — stored in Redis, not RAM)
     should_lazy = lazy and mode in ("brief", "summary") and not prompt and not already_indexed
 
     if should_lazy:
-        if session_id in _deferred_chunks:
-            _deferred_chunks[session_id].extend(chunks)
-        else:
-            _deferred_chunks[session_id] = chunks
+        defer_chunks(session_id, chunks)
 
-        print(f"⏳ Lazy mode: stored {len(chunks)} chunks for session {session_id[:8]}")
+        print(f"⏳ Lazy mode: stored {len(chunks)} chunks for session {session_id[:8]} (Redis)")
 
         # ── Trigger background indexing immediately ──────────────────
         import threading
@@ -886,7 +933,10 @@ def process_and_respond(
         t.start()
         # ─────────────────────────────────────────────────────────────
 
-        all_chunks = _deferred_chunks.get(session_id, chunks)
+        # Non-destructive read — background thread (or a concurrent
+        # ensure-indexed HTTP call) may pop these at any moment; peeking
+        # here just builds the fallback brief and doesn't race with that.
+        all_chunks = peek_deferred_chunks(session_id) or chunks
         fallback = "\n\n".join(c["content"] for c in all_chunks[:8])
         brief = rag_service.generate_brief(session_id, fallback_text=fallback)
 
@@ -906,12 +956,14 @@ def process_and_respond(
     if index:
         vector_store.ensure_collection()
         chunks_created = vector_store.add_documents(chunks, session_id=session_id)
-        if session_id in _deferred_chunks:
-            deferred = _deferred_chunks.pop(session_id)
-            if deferred:
-                deferred_count = vector_store.add_documents(deferred, session_id=session_id)
-                chunks_created += deferred_count
-                print(f"✅ Also indexed {deferred_count} deferred chunks for session {session_id[:8]}")
+
+        # Atomic pop — safe even if a background thread or another request
+        # is also trying to claim these at the same moment.
+        deferred = pop_deferred_chunks(session_id)
+        if deferred:
+            deferred_count = vector_store.add_documents(deferred, session_id=session_id)
+            chunks_created += deferred_count
+            print(f"✅ Also indexed {deferred_count} deferred chunks for session {session_id[:8]}")
         print(f"✅ Indexed {chunks_created} chunks for session {session_id[:8]}, doc_id={doc_id[:8]}...")
 
     # 7. Prompt given → RAG answer
@@ -920,7 +972,7 @@ def process_and_respond(
         return {
             "status":         "answered",
             "session_id":     session_id,
-            "doc_id":         doc_id,           
+            "doc_id":         doc_id,
             "chunks_indexed": chunks_created,
             "answer":         rag_result["answer"],
             "sources":        rag_result["sources"],
@@ -932,13 +984,13 @@ def process_and_respond(
     brief = rag_service.generate_brief(session_id)
 
     history = get_session_history(session_id)
-    history.add_ai_message(brief)
+    history.add_ai_message(brief, is_summary=True)
     save_session(session_id)
 
     return {
         "status":         "summarized",
         "session_id":     session_id,
-        "doc_id":         doc_id,               
+        "doc_id":         doc_id,
         "chunks_indexed": chunks_created,
         "summary":        brief,
         "scanned_note":   scanned_note,
@@ -948,11 +1000,16 @@ def process_and_respond(
 
 
 def ensure_indexed(session_id: str) -> bool:
-    """Trigger indexing for a lazy session before the first question."""
-    if session_id in _deferred_chunks:
-        chunks = _deferred_chunks.pop(session_id)
-        if not chunks:
-            return False
+    """
+    Trigger indexing for a lazy session before the first question.
+
+    Uses pop_deferred_chunks(), which atomically reads-and-clears the
+    Redis-backed queue via a Lua script — so this is safe to call
+    concurrently from the background thread AND the ensure-indexed HTTP
+    endpoint without double-indexing or racing on which caller "wins".
+    """
+    chunks = pop_deferred_chunks(session_id)
+    if chunks:
         vector_store.ensure_collection()
         count = vector_store.add_documents(chunks, session_id=session_id)
         print(f"🚀 Lazy indexing triggered: {count} chunks for session {session_id[:8]}")

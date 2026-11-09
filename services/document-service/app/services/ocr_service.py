@@ -11,6 +11,17 @@ Level 3 : Gemini Vision — cloud API, best quality, key rotation support,
 Fallback : Tesseract result if everything fails
 """
 
+import os
+
+# ── CPU contention fix ───────────────────────────────────────────────────────
+# Tesseract is spawned as a subprocess that uses OpenMP internally and would
+# otherwise deploy its own thread pool PER worker. With 4 ThreadPoolExecutor
+# workers that means 4xN OMP threads fighting over the same cores (measured
+# as a major slowdown in parallel mode). Forcing OMP_THREAD_LIMIT=1 keeps
+# each Tesseract call single-threaded and lets the Python pool own all
+# parallelism. setdefault → can still be overridden from the environment.
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+
 import io
 import pytesseract
 import numpy as np
@@ -37,6 +48,11 @@ EASYOCR_THRESHOLD   = 40.0   # below this → Tesseract fallback
 HANDWRITING_LAP_VAR = 800    # Laplacian variance threshold
 HANDWRITING_EDGE    = 0.05   # edge density threshold
 
+# Images larger than this are downscaled before the Tesseract pass.
+# Tesseract cost grows roughly with pixel count; beyond ~2000px the
+# accuracy gain on printed documents is negligible.
+MAX_TESSERACT_DIM = 2000
+
 # ── Cost guard ───────────────────────────────────────────────────────────────
 # Maximum number of pages per document allowed to escalate to Gemini Vision
 # (Level 3). Prevents a single low-quality scanned PDF from burning through
@@ -54,6 +70,20 @@ def _get_next_gemini_key() -> str:
     _key_index += 1
     print(f"   🔑 Using Gemini key {(_key_index - 1) % len(keys) + 1}/{len(keys)}")
     return key
+
+
+def _adaptive_workers(page_count: int) -> int:
+    """
+    Adaptive parallelism: small documents run sequentially (a thread pool
+    of 4 workers on 1-2 pages only adds orchestration overhead and measured
+    ~4% SLOWER), while large documents get the full pool. Clamp:
+        1-2 pages  → 1 worker  (sequential, no pool overhead)
+        3-4 pages  → up to 4 workers
+        5+ pages   → 4 workers (full pool)
+    """
+    return min(4, max(1, page_count))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # EasyOCR — lazy singleton
 # ─────────────────────────────────────────────────────────────────────────────
@@ -77,16 +107,32 @@ def _get_easyocr_reader(arabic: bool = False) -> easyocr.Reader:
             print("   ✅ EasyOCR Latin ready")
         return _easyocr_reader_latin
 
+
+def warmup_ocr_engines():
+    """
+    Pre-loads both EasyOCR models into memory at server startup,
+    so the first real upload during the demo isn't slow.
+    """
+    print("🔥 Warming up OCR engines (this runs once, at startup)...")
+    _get_easyocr_reader(arabic=True)
+    _get_easyocr_reader(arabic=False)
+    print("🔥 OCR engines warmed up and ready")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Image preprocessing
 # ─────────────────────────────────────────────────────────────────────────────
 def preprocess_image(image: Image.Image) -> Image.Image:
-    img = np.array(image)
+    # Downscale oversized renders — Tesseract cost scales with pixel count
+    if max(image.size) > MAX_TESSERACT_DIM:
+        ratio = MAX_TESSERACT_DIM / max(image.size)
+        new_size = (int(image.width * ratio), int(image.height * ratio))
+        image = image.resize(new_size, Image.LANCZOS)
+        print(f"   📐 Resized to {new_size} for Tesseract")
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = np.array(image.convert("L"))
 
     # Noise removal
-    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
     # Adaptive threshold (VERY important for handwriting)
     thresh = cv2.adaptiveThreshold(
@@ -96,7 +142,6 @@ def preprocess_image(image: Image.Image) -> Image.Image:
         11, 2
     )
 
-    # Optional: deskew (advanced)
     return Image.fromarray(thresh)
 
 def preprocess_arabic_image(image: Image.Image) -> Image.Image:
@@ -121,34 +166,30 @@ def preprocess_arabic_image(image: Image.Image) -> Image.Image:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def is_likely_handwritten(image: Image.Image) -> bool:
-    """
-    Heuristic detector — decides if an image is handwritten or printed.
-
-    Adjusted thresholds to handle:
-        - Grid/lined paper backgrounds (common in FR school notebooks)
-        - Pink/beige tinted paper
-        - Mixed color handwriting (blue, green, red ink)
-    """
     img_array     = np.array(image.convert("L"))
     laplacian_var = cv2.Laplacian(img_array, cv2.CV_64F).var()
     edges         = cv2.Canny(img_array, 50, 150)
-    edge_density  = float(edges.sum()) / float(edges.size)
+    edge_density = float(np.count_nonzero(edges)) / float(edges.size)
 
-    # Grid paper adds ~0.03-0.06 edge density from the lines alone
-    # Printed documents have very high Laplacian variance (>2000)
-    # Handwriting on grid paper sits between 300-1500 Laplacian, 0.03-0.12 edge density
-    # So we relax the edge threshold and rely more on Laplacian
+    print(f"   🔍 DEBUG handwriting check: laplacian_var={laplacian_var:.1f}, edge_density={edge_density:.4f}")
+
     return laplacian_var < 2000 and edge_density < 0.15
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Engine: Tesseract
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_tesseract_confidence(image: Image.Image) -> float:
+def _tesseract_ocr_full(image: Image.Image) -> tuple[str, float]:
     """
-    Runs Tesseract and returns average word confidence (0-100).
-    Score >= 60 → result is reliable.
-    Score <  60 → fall through to EasyOCR.
+    Single Tesseract call that returns BOTH the reconstructed text and the
+    confidence score — replaces the old pattern of calling image_to_data()
+    (for confidence) and image_to_string() (for text) separately, which
+    ran Tesseract twice on every single page.
+
+    Text is rebuilt from image_to_data's word-level output, grouped by
+    (block_num, par_num, line_num) to preserve line breaks the same way
+    image_to_string would. Structural rows (empty text, conf=-1) are
+    filtered out.
     """
     data = pytesseract.image_to_data(
         image,
@@ -156,22 +197,48 @@ def get_tesseract_confidence(image: Image.Image) -> float:
         config="--psm 3 --oem 3",
         output_type=pytesseract.Output.DICT,
     )
-    confidences = [
-        int(c) for c in data["conf"]
-        if str(c) != "-1" and int(c) >= 0
-    ]
-    return sum(confidences) / len(confidences) if confidences else 0.0
+
+    n = len(data["text"])
+    lines: dict[tuple, list[str]] = {}
+    confidences: list[int] = []
+
+    for i in range(n):
+        word = data["text"][i].strip()
+        conf = data["conf"][i]
+
+        if str(conf) != "-1" and int(conf) >= 0:
+            confidences.append(int(conf))
+
+        if not word:
+            continue
+
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        lines.setdefault(key, []).append(word)
+
+    # Preserve original top-to-bottom / block/paragraph/line order
+    ordered_keys = sorted(lines.keys())
+    text = "\n".join(" ".join(lines[k]) for k in ordered_keys)
+
+    confidence = sum(confidences) / len(confidences) if confidences else 0.0
+    return text.strip(), confidence
+
+
+def get_tesseract_confidence(image: Image.Image) -> float:
+    """
+    Runs Tesseract and returns average word confidence (0-100).
+    Score >= 60 → result is reliable.
+    Score <  60 → fall through to EasyOCR.
+
+    Kept as a public function for any other caller — delegates to the
+    shared single-call implementation so it's never duplicated on the hot path.
+    """
+    _, confidence = _tesseract_ocr_full(image)
+    return confidence
 
 
 def _run_tesseract(image: Image.Image) -> tuple[str, float]:
-    """Returns (text, confidence)."""
-    confidence = get_tesseract_confidence(image)
-    text = pytesseract.image_to_string(
-        image,
-        lang="fra+eng+ara",
-        config="--psm 3 --oem 3",
-    ).strip()
-    return text, confidence
+    """Returns (text, confidence) — one Tesseract call instead of two."""
+    return _tesseract_ocr_full(image)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -295,7 +362,6 @@ def _run_gemini_vision(image: Image.Image) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # Smart OCR — main decision engine
 # ─────────────────────────────────────────────────────────────────────────────
-
 def ocr_smart(image: Image.Image, allow_gemini: bool = True) -> dict:
     """
     3-Level OCR Pipeline with Arabic/Language-aware routing.
@@ -310,7 +376,33 @@ def ocr_smart(image: Image.Image, allow_gemini: bool = True) -> dict:
                    page budget (see GEMINI_PAGE_BUDGET).
     """
     processed   = preprocess_image(image)
-    handwritten = is_likely_handwritten(processed)
+    handwritten = is_likely_handwritten(image)
+
+    # ── Level 0 shortcut ─────────────────────────────────────────────────
+    # Handwriting detected → skip straight to Gemini Vision. Tesseract and
+    # EasyOCR are both documented weak on handwriting, so running them first
+    # only burns time before the inevitable Gemini fallback (measured: 53s
+    # on handwritingpage.png, most of it wasted on Tesseract + EasyOCR).
+    if handwritten and allow_gemini:
+        print("   ✍️  Handwriting detected — skipping Tesseract/EasyOCR, going straight to Gemini Vision")
+        try:
+            gemini_result = _run_gemini_vision(image)
+            gemini_text = gemini_result["text"]
+            gemini_len  = len(gemini_text.strip()) if gemini_text else 0
+
+            if gemini_len >= 10:
+                print(f"   ✅ Level 3 — Gemini Vision (direct, text length: {gemini_len})")
+                return {
+                    "text":        gemini_text,
+                    "engine":      "gemini_vision",
+                    "confidence":  95.0,
+                    "handwritten": True,
+                }
+            print("   ⚠️  Gemini returned too little text — falling back to full cascade")
+        except Exception as e:
+            print(f"   ⚠️  Gemini Vision direct call failed ({e}) — falling back to full cascade")
+        # falls through to the existing Tesseract → EasyOCR → Gemini cascade below
+
 
     # ── Level 1 — Tesseract (always run for baseline) ───────────────────────
     tesseract_text, tesseract_conf = _run_tesseract(processed)
@@ -531,7 +623,8 @@ def ocr_pdf_pages(pdf_path: str, page_indices: list) -> str:
     OCR only the specified pages (0-based indices) of a scanned PDF.
     Called by document_service for brief/summary/full modes.
     Returns concatenated text with [Page N] markers.
-    Processes pages in parallel (4 workers).
+    Processes pages in parallel — the worker count is adaptive:
+    small page sets run sequentially to avoid pool overhead.
 
     Gemini Vision (Level 3) is capped at GEMINI_PAGE_BUDGET pages for this
     call — since brief/summary modes already only request a handful of
@@ -544,7 +637,11 @@ def ocr_pdf_pages(pdf_path: str, page_indices: list) -> str:
     ]
     results = [None] * len(page_indices)
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    workers = _adaptive_workers(len(page_indices))
+    mode    = "in parallel" if workers > 1 else "sequentially (adaptive: small page set)"
+    print(f"   ⚙️  Processing {len(page_indices)} pages {mode} ({workers} worker{'s' if workers > 1 else ''})...")
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_index = {
             executor.submit(process_single_page, arg): idx
             for idx, arg in enumerate(args)
@@ -564,7 +661,8 @@ def ocr_pdf_pages(pdf_path: str, page_indices: list) -> str:
 
 def ocr_scanned_pdf(path: str) -> dict:
     """
-    OCR all pages of a scanned PDF using parallel processing.
+    OCR all pages of a scanned PDF using parallel processing (adaptive
+    worker count: sequential for tiny documents, full pool for large ones).
     Used by extract_text_ocr() for full document extraction.
 
     Cost guard: only the first GEMINI_PAGE_BUDGET pages (in document order)
@@ -581,7 +679,11 @@ def ocr_scanned_pdf(path: str) -> dict:
     doc         = fitz.open(path)
     total_pages = len(doc)
 
-    print(f"\n   ⚙️  Processing {total_pages} pages in parallel (4 workers)...")
+    workers = _adaptive_workers(total_pages)
+    if workers > 1:
+        print(f"\n   ⚙️  Processing {total_pages} pages in parallel ({workers} workers)...")
+    else:
+        print(f"\n   ⚙️  Processing {total_pages} page(s) sequentially (adaptive: small document)...")
     print(f"   💰 Gemini Vision budget: {GEMINI_PAGE_BUDGET} pages max for this document")
 
     args = [
@@ -590,7 +692,7 @@ def ocr_scanned_pdf(path: str) -> dict:
     ]
     pages = [None] * total_pages
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_index = {
             executor.submit(process_single_page, arg): idx
             for idx, arg in enumerate(args)

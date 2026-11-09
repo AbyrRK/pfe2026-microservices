@@ -1,11 +1,11 @@
 """
-app/services/table_service.py
+document-service/services/table_service.py
 ==============================
 Table extraction pipeline for invoices, contracts, and any tabular document.
 
 Strategy (same philosophy as OCR service):
     Native PDF  → pdfplumber  (fast, accurate, no dependencies)
-         ↓ no tables found
+         ↓ no tables found AND text looks tabular (cheap heuristic gate)
     Scanned PDF / Image → img2table + Tesseract
          ↓ still no tables
     Gemini Vision fallback (handles borderless / complex tables)
@@ -13,10 +13,27 @@ Strategy (same philosophy as OCR service):
 Output per table:
     - JSON  : structured rows/columns for RAG pipeline
     - Markdown : human-readable for display
+
+CHANGE (perf fixes — table extraction now runs on EVERY upload, not just
+mode=="table", so cost here matters a lot more than it used to):
+
+  1. Native-PDF path: pdfplumber runs first as before. If it finds nothing,
+     we no longer blindly cascade into img2table (full page rasterization +
+     Tesseract OCR) and then Gemini Vision (an API call per page) for EVERY
+     plain-text document. A cheap heuristic (`_looks_tabular`) now gates
+     whether that expensive fallback chain runs at all — most prose-only
+     documents never pay for it.
+
+  2. Scanned-PDF / image path: previously ran TWO independent OCR passes —
+     once inside img2table (for table cell detection) and once again via
+     ocr_service (for surrounding body text). Body text is now extracted
+     ONCE via ocr_service and passed in / reused, instead of triggering a
+     second full OCR pass through `_extract_text_for_pages`.
 """
 
 import io
 import json
+import re
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -42,14 +59,33 @@ def _page_to_image(pdf_path: str, page_index: int, dpi: int = 200) -> Image.Imag
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 
+def _clean_cell(cell) -> str:
+    """
+    Stringify a table cell, treating both None and pandas/numpy NaN as an
+    empty string. img2table returns cells from a pandas DataFrame, and a
+    bare `str(cell)` on a float NaN produces the literal text "nan" — which
+    was showing up verbatim in extracted Arabic tables (e.g. "| nan | nan |").
+    NaN != NaN is the standard (if slightly odd-looking) way to detect it
+    without importing pandas/numpy just for this check.
+    """
+    if cell is None:
+        return ""
+    if isinstance(cell, float) and cell != cell:  # NaN check
+        return ""
+    text = str(cell)
+    if text.strip().lower() == "nan":
+        return ""
+    return text
+
+
 def _table_to_markdown(table: list[list]) -> str:
     """Convert a list-of-rows table into a Markdown table string."""
     if not table:
         return ""
 
-    # Clean None values
+    # Clean None/NaN values
     cleaned = [
-        [str(cell) if cell is not None else "" for cell in row]
+        [_clean_cell(cell) for cell in row]
         for row in table
     ]
 
@@ -76,16 +112,47 @@ def _table_to_json(table: list[list]) -> list[dict]:
     if not table or len(table) < 2:
         return []
 
-    headers = [str(h) if h is not None else f"col_{i}"
-               for i, h in enumerate(table[0])]
+    headers = [
+        _clean_cell(h) or f"col_{i}"
+        for i, h in enumerate(table[0])
+    ]
     result  = []
     for row in table[1:]:
         row_dict = {}
         for i, header in enumerate(headers):
             cell = row[i] if i < len(row) else None
-            row_dict[header] = str(cell) if cell is not None else ""
+            row_dict[header] = _clean_cell(cell)
         result.append(row_dict)
     return result
+
+
+def _looks_tabular(text: str) -> bool:
+    """
+    Cheap heuristic used ONLY to decide whether it's worth paying for the
+    expensive img2table/Gemini fallback chain on a native PDF that
+    pdfplumber already failed to find tables in.
+
+    This is deliberately conservative in favor of running the fallback
+    (false positives just mean we still do the expensive check; false
+    negatives mean we silently miss a real table) — but it stops the
+    common case of a plain prose document paying full OCR + Vision API
+    cost on every single upload just to conclude "no tables here."
+
+    Signals:
+      - financial/table-ish keywords (multilingual: FR/EN/AR-adjacent)
+      - multiple lines with wide internal whitespace gaps, which is how
+        tab/space-aligned columns usually look once flattened to text
+    """
+    if not text or not text.strip():
+        return False
+
+    keyword_hit = bool(re.search(
+        r"\b(HT|TTC|TVA|total|montant|prix|qty|quantit|amount|price|subtotal)\b",
+        text, re.IGNORECASE
+    ))
+    aligned_lines = sum(1 for line in text.splitlines() if re.search(r"\s{3,}", line))
+
+    return keyword_hit or aligned_lines >= 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,6 +339,11 @@ def _extract_text_for_pages(pdf_path: str, page_indices: list[int], is_scanned: 
     """
     Extract surrounding text (non-table content) for context.
     Native → pdfplumber text. Scanned → reuse OCR service.
+
+    NOTE: for the scanned/image path, callers of `extract_tables()` should
+    prefer passing already-extracted OCR text via the `existing_text`
+    parameter instead of relying on this function to OCR a second time.
+    This function remains as the fallback path when no text was supplied.
     """
     if is_scanned:
         from app.services.ocr_service import ocr_pdf_pages
@@ -296,15 +368,21 @@ def extract_tables(
     file_path: str,
     page_indices: list[int],
     is_scanned: bool,
+    existing_text: Optional[str] = None,
 ) -> dict:
     """
     Extract tables + surrounding text from a PDF or image.
 
     Parameters
     ----------
-    file_path    : path to the file
-    page_indices : 0-based list of pages to process (from _select_pages)
-    is_scanned   : True → use img2table, False → try pdfplumber first
+    file_path     : path to the file
+    page_indices  : 0-based list of pages to process (from _select_pages)
+    is_scanned    : True → use img2table, False → try pdfplumber first
+    existing_text : OPTIONAL — if the caller already ran OCR / native text
+                    extraction for this document (e.g. document_service.py
+                    already calls ocr_pdf_pages for scanned PDFs), pass that
+                    text here to avoid a second, redundant OCR pass. If not
+                    provided, this function extracts text itself as before.
 
     Returns
     -------
@@ -321,7 +399,7 @@ def extract_tables(
 
     # ── Image file ────────────────────────────────────────────────────────────
     if is_image:
-        image  = Image.open(file_path).convert("RGB")
+        image = Image.open(file_path).convert("RGB")
 
         # img2table first
         tables_found = _extract_tables_img2table_image(image, page_num=1)
@@ -332,9 +410,12 @@ def extract_tables(
             tables_found = _extract_tables_gemini(image, page_num=1)
             engines_used.append("gemini")
 
-        # Text via OCR
-        from app.services.ocr_service import ocr_image_file
-        text = ocr_image_file(file_path)
+        # Text — reuse caller-supplied OCR text if available, otherwise OCR once
+        if existing_text is not None:
+            text = existing_text
+        else:
+            from app.services.ocr_service import ocr_image_file
+            text = ocr_image_file(file_path)
 
     # ── Native PDF ────────────────────────────────────────────────────────────
     elif not is_scanned:
@@ -342,26 +423,36 @@ def extract_tables(
         tables_found = _extract_tables_pdfplumber(file_path, page_indices)
         engines_used.append("pdfplumber")
 
-        # Level 2 — img2table if pdfplumber found nothing
-        if not tables_found:
+        # Surrounding text — reuse if supplied, otherwise extract now.
+        # Native-PDF text extraction via pdfplumber is cheap (no OCR), so
+        # doing it here even before deciding on fallbacks is fine cost-wise.
+        text = existing_text if existing_text is not None else \
+            _extract_text_for_pages(file_path, page_indices, is_scanned=False)
+
+        # Level 2/3 — only pay for the expensive fallback chain if pdfplumber
+        # found nothing AND the text actually looks like it might contain a
+        # table. Without this gate, EVERY plain prose document would trigger
+        # a full-page rasterization + Tesseract pass, and potentially a
+        # Gemini Vision API call per page, just to confirm "no tables here."
+        if not tables_found and _looks_tabular(text):
             tables_found = _extract_tables_img2table_pdf(file_path, page_indices)
             engines_used.append("img2table")
 
-        # Level 3 — Gemini fallback
-        if not tables_found and settings.GEMINI_API_KEY:
-            for idx in page_indices:
-                image  = _page_to_image(file_path, idx, dpi=200)
-                tables = _extract_tables_gemini(image, page_num=idx + 1)
-                tables_found.extend(tables)
-            if tables_found:
-                engines_used.append("gemini")
-
-        # Surrounding text
-        text = _extract_text_for_pages(file_path, page_indices, is_scanned=False)
+            if not tables_found and settings.GEMINI_API_KEY:
+                for idx in page_indices:
+                    image  = _page_to_image(file_path, idx, dpi=200)
+                    tables = _extract_tables_gemini(image, page_num=idx + 1)
+                    tables_found.extend(tables)
+                if tables_found:
+                    engines_used.append("gemini")
 
     # ── Scanned PDF ───────────────────────────────────────────────────────────
     else:
-        # img2table directly (already works on images)
+        # img2table directly (already works on images) — this is its OWN
+        # internal OCR pass for table CELL detection, separate from the
+        # body-text OCR below. We can't avoid this one without losing table
+        # detection, but we CAN avoid a second, redundant body-text OCR pass
+        # by reusing existing_text when the caller already has it.
         tables_found = _extract_tables_img2table_pdf(file_path, page_indices)
         engines_used.append("img2table")
 
@@ -374,8 +465,14 @@ def extract_tables(
             if tables_found:
                 engines_used.append("gemini")
 
-        # Surrounding text via OCR
-        text = _extract_text_for_pages(file_path, page_indices, is_scanned=True)
+        # Surrounding text — reuse caller-supplied OCR text if available.
+        # This is the fix for the double-OCR issue: document_service.py
+        # already runs ocr_pdf_pages() for scanned PDFs before calling here;
+        # passing that result in via existing_text skips a second full pass.
+        if existing_text is not None:
+            text = existing_text
+        else:
+            text = _extract_text_for_pages(file_path, page_indices, is_scanned=True)
 
     return {
         "tables":        tables_found,

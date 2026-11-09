@@ -634,7 +634,7 @@ function addDocumentCard(fileName, beforeElement) {
     if (beforeElement && beforeElement.parentNode) {
         messages.insertBefore(d, beforeElement);
     } else {
-        messages.appendChild(d);
+        messages.prepend(d);
     }
     messages.scrollTop = messages.scrollHeight;
     return d;
@@ -677,7 +677,7 @@ async function sendMessage() {
     const pending = attachedFiles.filter(function(f) { return !f.uploaded; });
     let msgAdded = false;
     if (pending.length) {
-      for (let i = 0; i < pending.length; i++) addDocumentCard(pending[i].name);
+      for (let i = pending.length - 1; i >= 0; i--) addDocumentCard(pending[i].name);
       addMessage(text, 'user');
       msgAdded = true;
       filePreviewList.innerHTML = '';
@@ -702,7 +702,7 @@ async function sendMessage() {
   messageInput.style.height = 'auto';
 
   if (pending.length) {
-    for (let i = 0; i < pending.length; i++) addDocumentCard(pending[i].name);
+    for (let i = pending.length - 1; i >= 0; i--) addDocumentCard(pending[i].name);
     if (text) addMessage(text, 'user');
     filePreviewList.innerHTML = '';
     for (let i = 0; i < pending.length; i++) {
@@ -851,7 +851,13 @@ function normalizeSources(raw) {
       content: s.content || s.chunk || '', excerpt: s.excerpt || s.content || s.chunk || '',
       page: s.page || null, score: s.score || null, doc_id: s.doc_id || '',
       chunk_index: s.chunk_index !== undefined ? s.chunk_index : null,
-      file: s.file_name || s.file || '', type: isWeb ? 'web' : 'document'
+      file: s.file_name || s.file || '', type: isWeb ? 'web' : 'document',
+      // web validity fields sent by citation_formatter
+      validity_pct: (s.validity_pct !== undefined && s.validity_pct !== null) ? s.validity_pct : null,
+      validity_label: s.validity_label || '',
+      validity_verified: s.validity_verified !== false,
+      validity_breakdown: s.validity_breakdown || null,
+      is_best: !!s.is_best
     };
   });
 }
@@ -864,7 +870,16 @@ function deduplicateSources(sources) {
     if (src.type === 'web') {
       const key = src.url || src.title;
       if (fileMap[key] !== undefined) {
-        idRemap[src.id] = merged[fileMap[key]].id;
+        const ex = merged[fileMap[key]];
+        idRemap[src.id] = ex.id;
+        // keep the best validity data when two web entries merge
+        if ((src.validity_pct || 0) > (ex.validity_pct || 0)) {
+          ex.validity_pct = src.validity_pct;
+          ex.validity_label = src.validity_label;
+          ex.validity_verified = src.validity_verified;
+          ex.validity_breakdown = src.validity_breakdown;
+        }
+        if (src.is_best) ex.is_best = true;
       } else {
         const newId = merged.length + 1;
         idRemap[src.id] = newId;
@@ -930,14 +945,20 @@ function formatAnswerWithSources(text, rawSources) {
   const answerCard = buildAnswerCard(text);
   if (!sources.length) return answerCard + '<div class="answer-body" data-rk="' + rk + '">' + (answerCard ? '' : html) + '</div>';
   const docSrcs = sources.filter(function(s) { return s.type === 'document'; });
-  const webSrcs = sources.filter(function(s) { return s.type === 'web'; });
+  // CHANGED: best source first, then verified, then by validity %
+  const webSrcs = sources.filter(function(s) { return s.type === 'web'; }).sort(function(a, b) {
+    if (!!a.is_best !== !!b.is_best) return a.is_best ? -1 : 1;
+    if ((a.validity_verified !== false) !== (b.validity_verified !== false)) return a.validity_verified === false ? 1 : -1;
+    return (b.validity_pct || 0) - (a.validity_pct || 0);
+  });
   let chips = '';
   if (docSrcs.length) {
     chips += '<div class="sources-section-label">📄 Documents</div>';
     docSrcs.forEach(function(s) { chips += buildSourceChip(s, rk); });
   }
   if (webSrcs.length) {
-    chips += '<div class="sources-section-label">🌐 Web</div>';
+    // CHANGED: explicit ranking label
+    chips += '<div class="sources-section-label">🌐 Web · ranked by validity</div>';
     webSrcs.forEach(function(s) { chips += buildSourceChip(s, rk); });
   }
   return answerCard + (answerCard ? '' : '<div class="answer-body" data-rk="' + rk + '">' + html + '</div>') + '<details class="sources-collapsible" open><summary><div class="sources-header"><span class="sources-title">📚 Sources</span><span class="sources-count">' + sources.length + '</span></div></summary><div class="sources-box" data-rk="' + rk + '">' + chips + '</div></details>';
@@ -958,6 +979,32 @@ function buildAnswerCard(text) {
   return '<div class="answer-card"><div class="answer-card-label">' + icon + ' ' + label + '</div><div class="answer-card-value">' + escHtml(value) + '</div>' + (sub ? '<div class="answer-card-sub">' + escHtml(sub) + '</div>' : '') + '</div>';
 }
 
+// validity bar for WEB sources only (documents return an empty string)
+function buildValidityHTML(src) {
+  if (src.type !== 'web' || src.validity_pct === null || src.validity_pct === undefined) return '';
+  const pct = Math.max(0, Math.min(100, Math.round(src.validity_pct)));
+  const unverified = src.validity_verified === false;
+  const color = unverified ? '#9ca3af' : pct >= 75 ? '#16a34a' : pct >= 55 ? '#f59e0b' : '#dc2626';
+  const label = unverified ? 'Unverified' : (src.validity_label || '');
+  const b = src.validity_breakdown || {};
+  const part = function(v) { return v !== undefined && v !== null ? v : '–'; };
+  const tip = 'Validity score — relevance ' + part(b.relevance) +
+    '% · authority ' + part(b.authority) +
+    '% · grounding ' + part(b.grounding) +
+    '% · freshness ' + part(b.freshness) + '%';
+  const best = (src.is_best && !unverified)
+    ? '<span style="background:#fef3c7;color:#92400e;font-size:0.65rem;font-weight:700;padding:1px 6px;border-radius:8px;margin-left:6px;">★ Best source</span>'
+    : '';
+  return '<div class="source-validity" title="' + escHtml(tip) + '" style="margin-top:5px;">' +
+    '<div style="display:flex;align-items:center;gap:8px;font-size:0.7rem;color:var(--text-secondary);">' +
+      '<div style="flex:1;max-width:120px;height:5px;background:#e5e7eb;border-radius:3px;overflow:hidden;">' +
+        '<div style="width:' + pct + '%;height:100%;background:' + color + ';"></div>' +
+      '</div>' +
+      '<span style="font-weight:700;color:' + color + ';">' + pct + '%</span>' +
+      '<span>' + escHtml(label) + '</span>' + best +
+    '</div></div>';
+}
+
 function buildSourceChip(src, rk) {
   const isWeb = src.type === 'web';
   let domain = '';
@@ -972,7 +1019,9 @@ function buildSourceChip(src, rk) {
   const cursor = (isWeb && src.url) || hasEx ? 'cursor:pointer;' : '';
   const badge = isWeb ? 'background:var(--success-50);color:var(--success-600);' : 'background:var(--primary-100);color:var(--primary-700);';
   const arrow = isWeb && src.url ? '<div class="source-arrow" style="color:var(--text-tertiary);flex-shrink:0;transition:transform var(--transition-fast);">→</div>' : (hasEx ? '<div class="source-arrow" style="color:var(--primary-300);flex-shrink:0;transition:transform var(--transition-fast);">📖</div>' : '');
-  return '<div class="source-chip ' + (isWeb ? 'web-source' : 'doc-source') + '" ' + onclick + ' style="' + cursor + '"><span class="source-num" style="' + badge + '">' + src.id + '</span>' + iconHtml + '<div class="source-info"><div class="source-title">' + escHtml(src.title) + '</div><div class="source-subtitle">' + escHtml(src.subtitle) + '</div></div>' + arrow + '</div>';
+  // CHANGED: golden frame on the best source
+  const bestStyle = (src.is_best && src.validity_verified !== false) ? 'border:1.5px solid #f59e0b;background:#fffbeb;' : '';
+  return '<div class="source-chip ' + (isWeb ? 'web-source' : 'doc-source') + '" ' + onclick + ' style="' + cursor + bestStyle + '"><span class="source-num" style="' + badge + '">' + src.id + '</span>' + iconHtml + '<div class="source-info"><div class="source-title">' + escHtml(src.title) + '</div><div class="source-subtitle">' + escHtml(src.subtitle) + '</div>' + buildValidityHTML(src) + '</div>' + arrow + '</div>';
 }
 
 function addMessage(text, sender, isSummary, sources) {
@@ -1320,6 +1369,13 @@ async function loadPastSession(sid, title, sessionType) {
     if (!isR && isDeepResearchMode) toggleDeepResearch();
     messageInput.placeholder = isR ? 'Ask a follow-up research question...' : 'Ask a follow-up question...';
     messageInput.focus();
+
+    // Insert all session files at the TOP of the conversation
+    for (let i = sessionFiles.length - 1; i >= 0; i--) {
+      addDocumentCard(sessionFiles[i].name);
+    }
+    messages.scrollTop = messages.scrollHeight;
+
     const assistantElements = [];
     const seenContent = new Set();
     let hasSuccessfulDoc = false;
@@ -1359,25 +1415,7 @@ async function loadPastSession(sid, title, sessionType) {
         assistantElements.push({ el: el, msg: msg, index: i });
       }
     }
-    let fileIndex = 0;
-    for (let i = 0; i < assistantElements.length; i++) {
-      const item = assistantElements[i];
-      const msg = item.msg;
-      const isDocBrief = (msg.content || '').includes('Document Brief') ||
-        (msg.content || '').includes('Voici un résumé') ||
-        (msg.content || '').includes('Voici un bref résumé') ||
-        (msg.content || '').includes('points principaux') ||
-        msg.is_summary === true ||
-        (msg.metadata && msg.metadata.is_summary === true);
-      if (isDocBrief && fileIndex < sessionFiles.length) {
-        addDocumentCard(sessionFiles[fileIndex].name, item.el);
-        fileIndex++;
-      }
-    }
-    while (fileIndex < sessionFiles.length) {
-      addDocumentCard(sessionFiles[fileIndex].name);
-      fileIndex++;
-    }
+
     const running = Object.values(backgroundTasks).find(function(t) { return !t.done && t.ownerSessionId === sid; });
     if (running) running.bubble = createResearchBubble('🔬 Research still running...');
     highlightActiveSession(sid);

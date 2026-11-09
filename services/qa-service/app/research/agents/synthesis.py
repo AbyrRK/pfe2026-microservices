@@ -4,8 +4,6 @@ import re
 import json
 from urllib.parse import urlparse
 
-from sympy import content
-
 from app.research.state import ResearchState
 from app.services.llm_client import llm
 
@@ -18,7 +16,8 @@ _WEB_SNIPPET_LEN = 300
 def synthesis_node(state: ResearchState) -> dict:
     ranked            = state.get("ranked_context", [])
     rag               = [r for r in ranked if r.get("source_type") == "document"]
-    web               = [r for r in ranked if r.get("source_type") == "web"]
+    # keep academic results too (the Web Agent tags them "academic")
+    web               = [r for r in ranked if r.get("source_type") in ("web", "academic")]
 
     lang              = state["language"]
     question          = state["question"]
@@ -74,7 +73,10 @@ def synthesis_node(state: ResearchState) -> dict:
             "file_name": "",
             "page":      "",
             "url":       url,
-            "content":   w.get("content", ""),
+            "content":   w.get("content", ""),   # full text, only the prompt snippet is cut
+            # needed by source_validity.py
+            "score":          w.get("raw_score", w.get("score", 0.5)),
+            "published_date": w.get("published_date"),
         })
 
     sources_text = "\n\n".join(source_blocks)
@@ -84,7 +86,7 @@ def synthesis_node(state: ResearchState) -> dict:
         "fr": "Answer entirely in French. Do not use any other language.",
         "en": "Answer entirely in English. Do not use any other language.",
     }.get(lang, f"Answer in the same language as the question ({lang}).")
-    
+
     from app.services.pii_scrubber import scrub_prompt
     sources_text = scrub_prompt(sources_text, language=lang)
 
@@ -97,7 +99,7 @@ def synthesis_node(state: ResearchState) -> dict:
         answer = llm.generate_sync(
             prompt=llm_prompt,
             temperature=0.7,
-            max_tokens=3000,      
+            max_tokens=3000,
             use_cache=True,
         )
 
@@ -144,7 +146,12 @@ INSTRUCTIONS:
 5. If no source supports a claim, do not make it.
 6. End with a ## Conclusion (2-3 sentences max) that gives the key takeaway and any recommended action.
 7. Do not repeat information already stated in an earlier section.
-8. After ## Conclusion, if there are genuine actionable recommendations based strictly on
+8. For time-sensitive questions (prices, rates, laws, regulations), use only the most
+   recent figures, state their date, and ignore outdated sources unless the user
+   asks for history. If sources give different years, say which one is current.
+9. Include only information that directly answers the question. Omit tangents and
+   sources that are not relevant to the question, even if they were retrieved.
+10. After ## Conclusion, if there are genuine actionable recommendations based strictly on
    the sources, append this block:
    ```json
    {{
@@ -237,19 +244,37 @@ def _rate_limit_message(lang: str) -> str:
 
 
 def _extract_recommendations(answer: str) -> tuple[list, str]:
+    """
+    Strips the trailing ```json recommendations block (if present) from the
+    answer and parses it separately.
+
+    If stripping the JSON block would leave no answer text at all (the model
+    started its reply with the block), treat it as a synthesis failure and
+    return an explicit error message instead of silently returning "".
+    """
+    empty_answer_fallback = (
+        "[System error — no answer text was generated. "
+        "Please rephrase your question or try again.]"
+    )
+
     # Match either a complete ```json block or a truncated one
     pattern = r'```json\s*(\{.*?"recommendations".*?\})\s*```'
     match = re.search(pattern, answer, re.DOTALL)
 
     if match:
+        clean_answer = answer[:match.start()].rstrip()
+        if not clean_answer:
+            print("⚠️  SYNTHESIS: JSON recommendations block found at position 0 "
+                  "(no answer text before it) — treating as synthesis failure "
+                  "instead of returning an empty answer")
+            return [], empty_answer_fallback
         try:
             data = json.loads(match.group(1))
             recommendations = data.get("recommendations", [])
-            clean_answer = answer[:match.start()].rstrip()
             return recommendations, clean_answer
         except Exception:
-            # JSON malformed — strip the block anyway
-            clean_answer = answer[:match.start()].rstrip()
+            # JSON malformed — strip the block anyway, but we already know
+            # clean_answer is non-empty at this point
             return [], clean_answer
 
     # Also strip truncated/unclosed ```json blocks that never got a closing ```
@@ -257,6 +282,11 @@ def _extract_recommendations(answer: str) -> tuple[list, str]:
     partial_match = re.search(partial_pattern, answer, re.DOTALL)
     if partial_match:
         clean_answer = answer[:partial_match.start()].rstrip()
+        if not clean_answer:
+            print("⚠️  SYNTHESIS: truncated JSON block found at position 0 "
+                  "(no answer text before it) — treating as synthesis failure "
+                  "instead of returning an empty answer")
+            return [], empty_answer_fallback
         return [], clean_answer
 
     return [], answer

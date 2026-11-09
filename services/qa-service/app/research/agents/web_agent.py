@@ -1,24 +1,12 @@
+import json
 import os
+import re
+
 import httpx
 from tavily import TavilyClient
 from app.research.state import ResearchState
 
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
-
-# ─────────────────────────────────────────────
-# Academic query detection
-# ─────────────────────────────────────────────
-
-ACADEMIC_KEYWORDS = [
-    # English
-    "paper", "article", "research", "published", "arxiv", "authors",
-    "citation", "conference", "journal", "pdf", "where can i find",
-    "source of", "who wrote", "transformer", "attention is all you need",
-    # French
-    "article", "papier", "recherche", "publié", "auteurs", "revue",
-    # Arabic
-    "بحث", "ورقة", "مقال", "نشر", "مؤلف", "مجلة",
-]
 
 ACADEMIC_DOMAINS = [
     "arxiv.org",
@@ -32,9 +20,51 @@ ACADEMIC_DOMAINS = [
     "researchgate.net",
 ]
 
-def _is_academic_query(question: str) -> bool:
-    q = question.lower()
-    return any(kw in q for kw in ACADEMIC_KEYWORDS)
+# ─────────────────────────────────────────────
+# LLM search planner (replaces the keyword list)
+# ─────────────────────────────────────────────
+
+_PLANNER_PROMPT = """You plan a web search for a business-document assistant.
+
+Question: "{question}"
+
+Decide:
+- "search_type": "academic" ONLY if the user explicitly wants scientific papers,
+  authors, citations or research literature. Otherwise "general".
+  (A question that merely contains words like "paper", "article" or "research",
+  for example "the TVA of the paper", is "general".)
+- "recent": true if the answer depends on current facts (prices, rates, laws,
+  regulations, news, "this year", "these days", "currently"), otherwise false.
+
+Reply ONLY with JSON: {{"search_type": "general", "recent": false}}"""
+
+
+def _plan_search(question: str) -> dict:
+    """Returns {"search_type": ..., "recent": ...}. Safe defaults on any failure."""
+    default = {"search_type": "general", "recent": False}
+    try:
+        from app.services.llm_client import llm
+
+        safe_q = question.replace('"', "'").replace("{", "").replace("}", "")[:400]
+        raw = llm.generate_sync(
+            prompt=_PLANNER_PROMPT.format(question=safe_q),
+            temperature=0,
+            max_tokens=60,
+            use_cache=True,
+        )
+        if not raw or raw.startswith("[System"):
+            return default
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return default
+        data = json.loads(match.group(0))
+        return {
+            "search_type": "academic" if data.get("search_type") == "academic" else "general",
+            "recent": bool(data.get("recent", False)),
+        }
+    except Exception as e:
+        print(f"🌐 WEB: search planner failed, using defaults: {e}")
+        return default
 
 
 # ─────────────────────────────────────────────
@@ -81,10 +111,12 @@ def _enrich_with_semantic_scholar(title: str) -> dict | None:
 # Tavily search helpers
 # ─────────────────────────────────────────────
 
-def _tavily_search(query: str, domains: list[str] | None = None) -> list[dict]:
+def _tavily_search(query: str, domains: list[str] | None = None,
+                   recent: bool = False) -> list[dict]:
     """
     Run a Tavily search. If `domains` is provided, restrict results to those.
-    Returns a list of {title, url, content, source_type} dicts.
+    If `recent` is True, ask Tavily for results from the last year only.
+    Returns a list of {title, url, content, score, published_date, source_type}.
     """
     kwargs = dict(
         query=query,
@@ -94,15 +126,24 @@ def _tavily_search(query: str, domains: list[str] | None = None) -> list[dict]:
     )
     if domains:
         kwargs["include_domains"] = domains
+    if recent:
+        kwargs["time_range"] = "year"
 
-    resp = tavily.search(**kwargs)
+    try:
+        resp = tavily.search(**kwargs)
+    except TypeError:
+        # Older client without time_range support: retry without it
+        kwargs.pop("time_range", None)
+        resp = tavily.search(**kwargs)
 
     return [
         {
-            "title":       r.get("title"),
-            "url":         r.get("url"),
-            "content":     r.get("content"),
-            "source_type": "academic" if domains else "web",
+            "title":          r.get("title"),
+            "url":            r.get("url"),
+            "content":        r.get("content"),
+            "score":          r.get("score", 0.5),
+            "published_date": r.get("published_date"),
+            "source_type":    "academic" if domains else "web",
         }
         for r in resp.get("results", [])
     ]
@@ -113,43 +154,45 @@ def _tavily_search(query: str, domains: list[str] | None = None) -> list[dict]:
 # ─────────────────────────────────────────────
 
 def web_node(state: ResearchState) -> dict:
-    # FIX: use "reformulated_query" (not "reformulated_question") to match state schema
     query    = state.get("reformulated_query") or state["question"]
     question = state["question"]
 
     print(f"🌐 WEB: searching for '{query[:60]}...'")
 
     try:
-        academic = _is_academic_query(question)
+        plan     = _plan_search(question)
+        academic = plan["search_type"] == "academic"
+        recent   = plan["recent"]
+        print(f"🌐 WEB: plan = {plan}")
 
         if academic:
-            print("🔬 WEB: academic query detected → using domain-restricted search")
+            print("🔬 WEB: academic query → using domain-restricted search")
             results = _tavily_search(query, domains=ACADEMIC_DOMAINS)
 
-            # Enrich each result with Semantic Scholar metadata
             for r in results:
                 enrichment = _enrich_with_semantic_scholar(r["title"] or query)
                 if enrichment:
-                    # Override URL with canonical arXiv link if available
                     if enrichment["canonical_url"]:
                         r["url"] = enrichment["canonical_url"]
                     r["pdf_url"] = enrichment.get("pdf_url")
                     r["authors"] = enrichment.get("authors", [])
                     r["year"]    = enrichment.get("year")
 
-            # If academic search returned nothing, fall back to general search
             if not results:
                 print("🌐 WEB: academic search empty → fallback to general")
+                results = _tavily_search(query, recent=recent)
+        else:
+            results = _tavily_search(query, recent=recent)
+            # Recency filter too strict? Retry without it rather than return nothing.
+            if not results and recent:
+                print("🌐 WEB: no recent results → retry without time filter")
                 results = _tavily_search(query)
 
-        else:
-            results = _tavily_search(query)
-
         print(f"🌐 WEB: found {len(results)} results "
-              f"({'academic' if academic else 'general'})")
+              f"({'academic' if academic else 'general'}{', recent' if recent else ''})")
         return {
             "web_results": results,
-            "web_confidence": min(len(results) / 5, 1.0)
+            "web_confidence": min(len(results) / 5, 1.0),
         }
 
     except Exception as e:

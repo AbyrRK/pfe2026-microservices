@@ -216,7 +216,6 @@ class RAGService:
             yield {"token": "Not found in document."}
             return
 
-        # Snapshot history BEFORE adding user message to avoid duplicate in prompt
         history = get_session_history(session_id)
         existing_messages = list(history.messages)
         history.add_user_message(question)
@@ -233,7 +232,15 @@ class RAGService:
             "history":  existing_messages,
         }):
             full_response.append(token)
-            yield {"token": token}
+            # If the underlying chunk is large (LLM didn't stream finely),
+            # break it into word-sized pieces so the UI still shows a
+            # visible typing effect instead of one block appearing.
+            if len(token) > 15:
+                words = token.split(" ")
+                for w in words:
+                    yield {"token": w + " "}
+            else:
+                yield {"token": token}
 
         clean = self._clean_answer("".join(full_response))
         history.add_ai_message(clean)

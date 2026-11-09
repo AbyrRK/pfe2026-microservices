@@ -31,10 +31,13 @@ services:
       - QDRANT_URL=http://qdrant:6333
       - QDRANT_COLLECTION=pfe2026_docs
       - REDIS_URL=redis://redis:6379/0
+      - TESSERACT_PATH=tesseract
     depends_on:
       - qdrant
     volumes:
       - ./data:/app/data
+      - ./services/document-service/app:/app/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
     restart: unless-stopped
 
   qa-service:
@@ -58,6 +61,8 @@ services:
       - document-service
     volumes:
       - ./data:/app/data
+      - ./services/qa-service/app:/app/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8002 --reload
     restart: unless-stopped
 
   celery-worker:
@@ -81,6 +86,7 @@ services:
       - document-service
     volumes:
       - ./data:/app/data
+      - ./services/qa-service/app:/app/app      # NEW: worker runs your host code
     restart: unless-stopped
 
   redis:

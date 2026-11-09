@@ -1,3 +1,6 @@
+import re
+import hashlib
+
 from app.research.state import ResearchState
 from app.services.vector_store import vector_store
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
@@ -14,27 +17,97 @@ SUMMARY_SIGNALS = {
 
 
 def _has_summary_chunk(chunks: list) -> bool:
+    """
+    Detects whether at least one chunk contains totals/TVA-related content.
+
+    Hardened against formatting variants that would otherwise defeat a plain
+    substring check — e.g. "T.V.A", "T V A", "tva" should all be recognized
+    as the same signal. Also falls back to a bare percentage near a tax
+    keyword (e.g. "19%" near "tva"/"tax") in case the exact SUMMARY_SIGNALS
+    words don't appear verbatim.
+    """
     for c in chunks:
         content_lower = (
             c.get("content", "").lower() if isinstance(c, dict)
             else c.page_content.lower()
         )
-        if any(sig in content_lower for sig in SUMMARY_SIGNALS):
+
+        # Normalize punctuation/whitespace so "t.v.a" / "t v a" / "tva" match
+        normalized = re.sub(r"[.\s]+", "", content_lower)
+
+        if any(
+            sig.replace(".", "").replace(" ", "") in normalized
+            for sig in SUMMARY_SIGNALS
+        ):
             return True
+
+        # Fallback: a percentage figure near a tax keyword (catches totals
+        # lines that use "%" without spelling out "tva"/"ttc" nearby)
+        if re.search(r"\b(1[0-9]|[0-9])\s?%", content_lower) and (
+            "tax" in content_lower or "tva" in normalized
+        ):
+            return True
+
     return False
+
+
+def _chunk_index_of(point) -> int:
+    """
+    Reads chunk_index from a Qdrant point's payload, handling both the flat
+    and double-nested metadata shapes that show up across the ingestion /
+    search paths (same fallback pattern used in the format loop below).
+    Returns 0 only if chunk_index is genuinely missing in both shapes —
+    NOT as a silent default that makes every point tie during sort.
+    """
+    meta = point.payload.get("metadata", {}) or {}
+    nested = meta.get("metadata", {}) or {}
+
+    idx = meta.get("chunk_index")
+    if idx is None:
+        idx = nested.get("chunk_index")
+    if idx is None:
+        idx = 0
+
+    return idx
+
+
+def _dedup_key_for(doc) -> str:
+    """
+    Strong dedup key for a Document. Prefers the chunk_hash already stored
+    in metadata at indexing time (see chunking_service.py — it's an MD5 of
+    the FULL chunk text, unique per chunk). Falls back to hashing the full
+    page_content ourselves if chunk_hash is missing for any reason.
+
+    IMPORTANT: this must never be a truncated prefix of the content. Two
+    genuinely different chunks (e.g. a table chunk and a totals/text chunk)
+    can easily share the same page header / first ~120 chars — a prefix key
+    collides on them and silently drops one during merge, which is exactly
+    what happened to the TVA/TTC chunk here.
+    """
+    meta = doc.metadata or {}
+    nested = meta.get("metadata", {}) or {}
+    chunk_hash = meta.get("chunk_hash") or nested.get("chunk_hash")
+    if chunk_hash:
+        return chunk_hash
+    return hashlib.md5(doc.page_content.encode()).hexdigest()
+
+
+def _build_scope_filter(doc_id: str = "", session_id: str = ""):
+    if doc_id:
+        return Filter(must=[FieldCondition(
+            key="metadata.doc_id", match=MatchValue(value=doc_id)
+        )])
+    elif session_id:
+        return Filter(must=[FieldCondition(
+            key="metadata.session_id", match=MatchValue(value=session_id)
+        )])
+    return None
 
 
 def _count_chunks(doc_id: str = "", session_id: str = "") -> int:
     try:
-        if doc_id:
-            filt = Filter(must=[FieldCondition(
-                key="metadata.doc_id", match=MatchValue(value=doc_id)
-            )])
-        elif session_id:
-            filt = Filter(must=[FieldCondition(
-                key="metadata.session_id", match=MatchValue(value=session_id)
-            )])
-        else:
+        filt = _build_scope_filter(doc_id=doc_id, session_id=session_id)
+        if filt is None:
             return 0
 
         points, _ = vector_store.client.scroll(
@@ -50,17 +123,51 @@ def _count_chunks(doc_id: str = "", session_id: str = "") -> int:
         return 999
 
 
+def _get_all_chunks(doc_id: str = "", session_id: str = "") -> list:
+    """
+    Fetch EVERY chunk for a doc/session, unranked. Used for small documents
+    where semantic top-k search can silently drop the one chunk that
+    contains the answer (e.g. the totals/TVA line) just because it doesn't
+    score highest for a given query. When you already have all the chunks,
+    ranking only adds risk — so for small docs we skip it entirely.
+    """
+    try:
+        filt = _build_scope_filter(doc_id=doc_id, session_id=session_id)
+        if filt is None:
+            return []
+
+        points, _ = vector_store.client.scroll(
+            collection_name=vector_store.collection_name,
+            scroll_filter=filt,
+            limit=200,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        sorted_points = sorted(points, key=_chunk_index_of)
+
+        # DEBUG — shows exactly what the small-doc path had available
+        for p in sorted_points:
+            preview = p.payload.get("page_content", "")[:200].replace("\n", " ")
+            print(f"📄 RAG: [all-chunks] idx={_chunk_index_of(p)} → '{preview}'")
+
+        results = []
+        for p in sorted_points:
+            doc = Document(
+                page_content=p.payload.get("page_content", ""),
+                metadata=p.payload.get("metadata", {})
+            )
+            results.append((doc, _dedup_key_for(doc)))
+        return results
+    except Exception as e:
+        print(f"📄 RAG: fetch-all failed: {e}")
+        return []
+
+
 def _get_tail_chunks(doc_id: str = "", session_id: str = "", n: int = 5) -> list:
     try:
-        if doc_id:
-            filt = Filter(must=[FieldCondition(
-                key="metadata.doc_id", match=MatchValue(value=doc_id)
-            )])
-        elif session_id:
-            filt = Filter(must=[FieldCondition(
-                key="metadata.session_id", match=MatchValue(value=session_id)
-            )])
-        else:
+        filt = _build_scope_filter(doc_id=doc_id, session_id=session_id)
+        if filt is None:
             return []
 
         all_points, _ = vector_store.client.scroll(
@@ -71,30 +178,28 @@ def _get_tail_chunks(doc_id: str = "", session_id: str = "", n: int = 5) -> list
             with_vectors=False,
         )
 
-        sorted_points = sorted(
-            all_points,
-            key=lambda p: p.payload.get("metadata", {}).get("chunk_index", 0)
-        )
+        # DEBUG — temporary, remove once you've confirmed real indices show up
+        print(f"📄 RAG: tail sort keys → {[_chunk_index_of(p) for p in all_points]}")
+
+        sorted_points = sorted(all_points, key=_chunk_index_of)
 
         tail = sorted_points[-n:] if len(sorted_points) >= n else sorted_points
 
-        return [
-            (
-                Document(
-                    page_content=p.payload.get("page_content", ""),
-                    metadata=p.payload.get("metadata", {})
-                ),
-                str(p.id)
+        results = []
+        for p in tail:
+            doc = Document(
+                page_content=p.payload.get("page_content", ""),
+                metadata=p.payload.get("metadata", {})
             )
-            for p in tail
-        ]
+            results.append((doc, _dedup_key_for(doc)))
+        return results
     except Exception as e:
         print(f"📄 RAG: tail fetch failed: {e}")
         return []
 
 
 def _wrap_search_results(docs: list) -> list:
-    return [(doc, doc.page_content[:120].strip()) for doc in docs]
+    return [(doc, _dedup_key_for(doc)) for doc in docs]
 
 
 def rag_node(state: ResearchState) -> dict:
@@ -114,18 +219,25 @@ def rag_node(state: ResearchState) -> dict:
     )
 
     if total_chunks <= _SMALL_DOC_THRESHOLD:
-        print(f"📄 RAG: small doc ({total_chunks} chunks) → high-k semantic search")
-        if doc_id:
-            raw = vector_store.search_by_doc(query, doc_id=doc_id, k=total_chunks)
-            print(f"📄 RAG: used doc_id scope → {len(raw)} chunks")
-            if not raw:
-                raw = vector_store.search_by_session(query, session_id=session_id, k=total_chunks)
-                print(f"📄 RAG: fallback session scope → {len(raw)} chunks")
-        else:
-            raw = vector_store.search_by_session(query, session_id=session_id, k=total_chunks)
-            print(f"📄 RAG: used session scope → {len(raw)} chunks")
+        # Small doc: fetch ALL chunks unconditionally instead of ranking via
+        # semantic search. With so few chunks, top-k similarity search can
+        # rank the answer-bearing chunk (e.g. totals/TVA line) below the cut
+        # and silently drop it. "All chunks" is a strict superset of what
+        # search would return, so this can only help.
+        print(f"📄 RAG: small doc ({total_chunks} chunks) → fetching ALL chunks (no ranking)")
+        paired = _get_all_chunks(
+            doc_id=doc_id,
+            session_id=session_id if not doc_id else ""
+        )
+        print(f"📄 RAG: fetched {len(paired)} chunks")
 
-        paired      = _wrap_search_results(raw)
+        # Fallback in case the scope filter above returns nothing (e.g. only
+        # doc_id was set but points are indexed under session_id, or vice
+        # versa) — mirrors the original doc_id → session_id fallback.
+        if not paired and doc_id:
+            paired = _get_all_chunks(session_id=session_id)
+            print(f"📄 RAG: fallback session scope (all chunks) → {len(paired)} chunks")
+
         tail_paired = []
 
     else:
@@ -151,13 +263,18 @@ def rag_node(state: ResearchState) -> dict:
             seen.add(dedup_key)
             merged.append(doc)
 
-    print(f"📄 RAG: {len(paired)} semantic + {len(tail_paired)} tail → {len(merged)} after dedup")
+    print(f"📄 RAG: {len(paired)} primary + {len(tail_paired)} tail → {len(merged)} after dedup")
 
     if not merged:
         print("📄 RAG: ⚠️  No chunks found")
         return {"rag_results": [], "rag_confidence": 0.0}
 
     # ── Totals safety net — runs BEFORE format loop ───────────────────────────
+    # Still useful for the >10-chunk path (semantic search can still miss the
+    # totals chunk there). For the small-doc path this should now almost
+    # always already be satisfied since we fetched everything above — if it
+    # still fires there, it means the totals/TVA text genuinely isn't in any
+    # indexed chunk for this document.
     if not _has_summary_chunk(merged):
         print("📄 RAG: ⚠️  No totals/TVA chunk found — force-fetching tail chunks")
         force_tail = _get_tail_chunks(

@@ -38,6 +38,7 @@ def reranker_node(state: ResearchState) -> dict:
             "chunk_index": r.get("chunk_index", 0),
             "score":       round(raw_score * weight, 4),
             "content_type": r.get("content_type", "text"),
+            
         })
 
     for w in web:
@@ -54,6 +55,8 @@ def reranker_node(state: ResearchState) -> dict:
             "doc_id":      "",
             "chunk_index": None,
             "score":       round(raw_score * weight, 4),
+            "raw_score":      raw_score,                   
+            "published_date": w.get("published_date"),     
         })
 
     # ── Step 2: Sort by score descending ─────────────────────────────────────

@@ -33,16 +33,17 @@ class ResearchRequest(BaseModel):
     doc_ids: Optional[List[str]] = None
 
 
+# CHANGED: sources optional, question added
 class SaveSourcesPayload(BaseModel):
-    sources: list
+    sources: list = []
     answer: str
+    question: Optional[str] = None
 
 
 @router.post("/query")
 def start_research(payload: ResearchRequest):
     """Start research — returns task_id immediately."""
 
-    # Sanitize on the route level before anything touches the value
     clean_session_id = _sanitize_session_id(payload.session_id)
     clean_doc_id     = _sanitize_session_id(payload.doc_id) or ""
     clean_doc_ids    = payload.doc_ids or []
@@ -61,8 +62,6 @@ def start_research(payload: ResearchRequest):
         doc_ids=clean_doc_ids,
     )
     return {"task_id": task.id, "status": "started"}
-
-
 
 
 @router.get("/status/{task_id}")
@@ -92,16 +91,34 @@ def get_research_status(task_id: str):
     }
 
 
+# CHANGED: saves the exchange in the chat history (question + answer + sources)
 @router.post("/session/{session_id}/save-sources")
 async def save_session_sources(session_id: str, payload: SaveSourcesPayload):
-    """Save sources and answer to session metadata for persistence."""
-    from app.services.chat_memory import set_session_metadata
+    """Persist the research exchange in the chat history so it survives a refresh."""
+    from app.services.chat_memory import get_session_history, set_session_metadata
+
+    answer = (payload.answer or "").strip()
+    if not answer or answer.startswith("[System"):
+        return {"saved": False, "reason": "no valid answer"}
+
+    history = get_session_history(session_id)
+    existing = history.messages_with_meta()
+
+    # Idempotent: never save the same answer twice
+    already = any(m.get("role") == "ai" and m.get("content") == answer for m in existing)
+    if not already:
+        q = (payload.question or "").strip()
+        last_human = next((m for m in reversed(existing) if m.get("role") == "human"), None)
+        if q and not (last_human and last_human.get("content") == q):
+            history.add_user_message(q)
+        history.add_ai_message(answer, sources=payload.sources)
 
     set_session_metadata(
         session_id=session_id,
+        session_type="research",
         extra_metadata={
             "last_research_sources": payload.sources,
-            "last_research_answer":  payload.answer,
-        }
+            "last_research_answer": answer,
+        },
     )
-    return {"saved": True}
+    return {"saved": not already}

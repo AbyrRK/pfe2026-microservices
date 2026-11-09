@@ -18,6 +18,11 @@ from pydantic import BaseModel
 from typing import Optional, List
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 from app.services import vector_store
+from pathlib import Path
+
+from app.services.document_service import process_document
+from app.services.deferred_chunks import pop_deferred_chunks
+from app.services.vector_store import vector_store as vs
 from app.services.document_service import (
     extract_skeleton,
     process_and_respond,
@@ -55,32 +60,46 @@ def _background_full_index(
     doc_id:        str,
     original_name: str = "",
 ) -> None:
+    """
+    Background task queued on every upload.
+
+    FIX: previously imported `_deferred_chunks` (the old in-memory dict)
+    directly from document_service — that attribute no longer exists after
+    the Redis migration, so this raised ImportError on every call. Because
+    both the deferred-chunk flush AND the full-page indexing lived in the
+    same try block, that ImportError silently skipped full-page indexing
+    entirely, every time, with only a print statement to notice it by.
+
+    Now uses the same Redis-backed pop_deferred_chunks() that
+    ensure_indexed() uses (safe to call concurrently — atomic pop), and the
+    two concerns are split into separate try/except blocks so a failure in
+    one can never prevent the other from running.
+    """
+
+    # ── First: flush any deferred chunks from the lazy path ────────────────
+    # Isolated so a failure here can't skip the full-page indexing below.
     try:
-        # First: flush any deferred chunks from the lazy path
-        from app.services.document_service import _deferred_chunks
-        from app.services.vector_store import vector_store as vs
+        deferred = pop_deferred_chunks(session_id)
+        if deferred:
+            print(f"🚀 Flushing {len(deferred)} deferred chunks for session {session_id[:8]}...")
+            for attempt in range(4):
+                try:
+                    vs.ensure_collection()
+                    count = vs.add_documents(deferred, session_id=session_id)
+                    print(f"✅ Deferred indexing complete: {count} chunks for session {session_id[:8]}")
+                    break
+                except Exception as e:
+                    wait = 2 ** attempt
+                    print(f"⚠️  Embedding attempt {attempt + 1} failed: {e}. Retrying in {wait}s...")
+                    time.sleep(wait)
+            else:
+                print(f"❌ All embedding attempts failed for session {session_id[:8]} — deferred chunks lost")
+    except Exception as e:
+        print(f"⚠️  Deferred-chunk flush failed for session {session_id[:8]}: {e}")
 
-        if session_id in _deferred_chunks:
-            deferred = _deferred_chunks.pop(session_id)
-            if deferred:
-                print(f"🚀 Flushing {len(deferred)} deferred chunks for session {session_id[:8]}...")
-                # Retry loop for embedding
-                for attempt in range(4):
-                    try:
-                        vs.ensure_collection()
-                        count = vs.add_documents(deferred, session_id=session_id)
-                        print(f"✅ Deferred indexing complete: {count} chunks for session {session_id[:8]}")
-                        break
-                    except Exception as e:
-                        wait = 2 ** attempt
-                        print(f"⚠️  Embedding attempt {attempt+1} failed: {e}. Retrying in {wait}s...")
-                        time.sleep(wait)
-                else:
-                    print(f"❌ All embedding attempts failed for session {session_id[:8]}")
-                    return
-
-        # Then: index remaining pages not covered by brief mode
-        # (only if file still exists)
+    # ── Then: index remaining pages not covered by brief mode ──────────────
+    # Runs regardless of whether the flush above succeeded.
+    try:
         if Path(tmp_path).exists():
             process_document(
                 file_path=tmp_path,
@@ -91,12 +110,10 @@ def _background_full_index(
                 doc_id=doc_id,
             )
             print(f"✅ Full indexing complete — session: {session_id[:8]}, doc_id: {doc_id[:8]}")
-
     except Exception as e:
-        print(f"❌ Background indexing failed — session: {session_id[:8]} — {e}")
+        print(f"❌ Background full-page indexing failed — session: {session_id[:8]} — {e}")
     finally:
         Path(tmp_path).unlink(missing_ok=True)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Upload route

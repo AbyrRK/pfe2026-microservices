@@ -7,9 +7,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import json
 
 from app.services.rag_service import rag_service
-from app.services.document_client import ensure_indexed_remote
 from app.services.chat_memory import delete_session
-
+from app.services.document_client import ensure_indexed_remote
 router = APIRouter()
 
 
